@@ -1,0 +1,139 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: counters-cicd
+spec:
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+    - name: git-revision
+      type: string
+      default: main
+      description: Git branch or commit
+    - name: app-name
+      type: string
+      default: counters-api
+      description: OpenShift Deployment name
+    - name: build-image
+      type: string
+      description: Full image URL to build & push (e.g. image-registry.openshift-image-registry.svc:5000/<ns>/counters-api:latest)
+  workspaces:
+    - name: output
+
+  tasks:
+    # 1) cleanup
+    - name: cleanup
+      taskRef:
+        name: cleanup
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 2) git clone
+    - name: git-clone
+      runAfter: [cleanup]
+      taskRef:
+        kind: ClusterTask
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: depth
+          value: "1"
+      workspaces:
+        - name: output
+          workspace: output
+
+    # 3) flake8 linting (inline)
+    - name: flake8
+      runAfter: [git-clone]
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: lint
+            image: python:3.9-slim
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/bin/bash
+              set -e
+              python -m pip install --upgrade pip wheel
+              pip install -r requirements.txt
+              pip install flake8
+              flake8 service --count --select=E9,F63,F7,F82 --show-source --statistics
+              flake8 service --count --max-complexity=10 --max-line-length=127 --statistics
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 4) nose tests (usa sua Task)
+    - name: nose
+      runAfter: [flake8]
+      taskRef:
+        name: nose
+      params:
+        - name: args
+          value: "-v --with-spec --spec-color --with-coverage --cover-package=app"
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 5) build image com buildah (inline)
+    - name: build
+      runAfter: [nose]
+      taskSpec:
+        params:
+          - name: image
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: build-and-push
+            image: quay.io/buildah/stable:v1.34
+            securityContext:
+              privileged: true
+            workingDir: /workspace/source
+            script: |
+              #!/bin/bash
+              set -eux
+              buildah version
+              # build
+              buildah bud -f Dockerfile -t $(params.image) .
+              # push (desativa verificação TLS no registry interno do OpenShift)
+              buildah push --tls-verify=false $(params.image)
+      params:
+        - name: image
+          value: $(params.build-image)
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 6) deploy com oc (inline)
+    - name: deploy
+      runAfter: [build]
+      taskSpec:
+        params:
+          - name: app-name
+            type: string
+          - name: build-image
+            type: string
+        steps:
+          - name: oc-deploy
+            image: registry.redhat.io/openshift4/ose-cli:latest
+            script: |
+              #!/bin/bash
+              set -eux
+              # cria ou aplica o Deployment a partir de um dry-run
+              oc create deployment $(params.app-name) --image=$(params.build-image) --dry-run=client -o yaml | oc apply -f -
+              # expõe via Service (caso ainda não exista)
+              kubectl get svc $(params.app-name) >/dev/null 2>&1 || oc expose deployment $(params.app-name) --port=8080
+              # cria a Route (caso ainda não exista)
+              kubectl get route $(params.app-name) >/dev/null 2>&1 || oc expose svc $(params.app-name)
+      params:
+        - name: app-name
+          value: $(params.app-name)
+        - name: build-image
+          value: $(params.build-image)
